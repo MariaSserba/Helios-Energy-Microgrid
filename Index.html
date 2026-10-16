@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract HeliosEnergyMicrogrid {
+    struct EnergyListing {
+        address payable producer;
+        uint256 pricePerKWhWei;
+        uint256 availableKWh;
+        bool isActive;
+        bytes32 gridNodeHash;
+    }
+
+    address payable public immutable gridOperator;
+    string public gridDescriptor;
+    uint256 public gridFeeBps; // 150 = 1.5%
+    uint256 public listingCounter;
+    uint256 public accumulatedFees;
+    bool public isGridPaused;
+
+    mapping(address => bool) public authorizedProducers;
+    mapping(uint256 => EnergyListing) public listings;
+    mapping(address => uint256) public consumerCreditsKWh;
+
+    event ProducerAuthorized(address indexed producer);
+    event EnergyPurchased(uint256 indexed listingId, address indexed consumer, uint256 amountKWh, uint256 costWei);
+    event ListingCanceled(uint256 indexed listingId);
+    event TreasuryDrained(address indexed operator, uint256 amount);
+    event FeesHarvested(address indexed operator, uint256 amount);
+    event CapacityListed(uint256 indexed listingId, address indexed producer, uint256 pricePerKWh, uint256 capacityKWh);
+    event GridPauseToggled(bool isPaused);
+    event ProducerRevoked(address indexed producer);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyOperator() {
+        require(msg.sender == gridOperator, "HeliosGrid: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isGridPaused, "HeliosGrid: Grid paused");
+        _;
+    }
+
+    constructor() {
+        gridOperator = payable(msg.sender);
+        gridDescriptor = "Helios Base Renewable Energy Microgrid v1";
+        gridFeeBps = 150; // 1.5%
+        isGridPaused = false;
+        authorizedProducers[msg.sender] = true;
+    }
+
+    // 1. addEnergyProducer
+    function addEnergyProducer(address producer) external onlyOperator {
+        require(!authorizedProducers[producer], "HeliosGrid: Already authorized");
+        authorizedProducers[producer] = true;
+        emit ProducerAuthorized(producer);
+    }
+
+    // 2. buyEnergyCredits
+    function buyEnergyCredits(uint256 listingId, uint256 amountKWh) external payable whenNotPaused {
+        EnergyListing storage listing = listings[listingId];
+        require(listingId > 0 && listingId <= listingCounter, "HeliosGrid: Invalid ID");
+        require(listing.isActive, "HeliosGrid: Listing inactive");
+        require(amountKWh > 0 && listing.availableKWh >= amountKWh, "HeliosGrid: Insufficient capacity");
+
+        uint256 totalCost = amountKWh * listing.pricePerKWhWei;
+        require(msg.value >= totalCost, "HeliosGrid: Insufficient payment");
+
+        uint256 fee = (totalCost * gridFeeBps) / 10000;
+        uint256 producerRevenue = totalCost - fee;
+
+        accumulatedFees += fee;
+        listing.availableKWh -= amountKWh;
+        consumerCreditsKWh[msg.sender] += amountKWh;
+
+        (bool sent, ) = listing.producer.call{value: producerRevenue}("");
+        require(sent, "HeliosGrid: Producer payout failed");
+
+        emit EnergyPurchased(listingId, msg.sender, amountKWh, totalCost);
+    }
+
+    // 3. cancelEnergyListing
+    function cancelEnergyListing(uint256 listingId) external {
+        EnergyListing storage listing = listings[listingId];
+        require(listingId > 0 && listingId <= listingCounter, "HeliosGrid: Invalid ID");
+        require(msg.sender == listing.producer || msg.sender == gridOperator, "HeliosGrid: Unauthorized");
+        require(listing.isActive, "HeliosGrid: Already inactive");
+
+        listing.isActive = false;
+        emit ListingCanceled(listingId);
+    }
+
+    // 4. drainGridTreasury
+    function drainGridTreasury() external onlyOperator {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "HeliosGrid: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = gridOperator.call{value: balance}("");
+        require(sent, "HeliosGrid: Sweep failed");
+
+        emit TreasuryDrained(gridOperator, balance);
+    }
+
+    // 5. harvestGridFees
+    function harvestGridFees() external onlyOperator {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "HeliosGrid: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = gridOperator.call{value: amount}("");
+        require(sent, "HeliosGrid: Harvest failed");
+
+        emit FeesHarvested(gridOperator, amount);
+    }
+
+    // 6. listEnergyCapacity
+    function listEnergyCapacity(uint256 pricePerKWhWei, uint256 totalKWh, bytes32 gridNodeHash) external whenNotPaused returns (uint256) {
+        require(authorizedProducers[msg.sender], "HeliosGrid: Not authorized");
+        require(pricePerKWhWei > 0 && totalKWh > 0, "HeliosGrid: Invalid params");
+
+        listingCounter++;
+        listings[listingCounter] = EnergyListing({
+            producer: payable(msg.sender),
+            pricePerKWhWei: pricePerKWhWei,
+            availableKWh: totalKWh,
+            isActive: true,
+            gridNodeHash: gridNodeHash
+        });
+
+        emit CapacityListed(listingCounter, msg.sender, pricePerKWhWei, totalKWh);
+        return listingCounter;
+    }
+
+    // 7. pauseEnergyGrid
+    function pauseEnergyGrid(bool isPaused) external onlyOperator {
+        isGridPaused = isPaused;
+        emit GridPauseToggled(isPaused);
+    }
+
+    // 8. revokeProducerAccess
+    function revokeProducerAccess(address producer) external onlyOperator {
+        require(authorizedProducers[producer], "HeliosGrid: Not a producer");
+        require(producer != msg.sender, "HeliosGrid: Cannot revoke self");
+        authorizedProducers[producer] = false;
+        emit ProducerRevoked(producer);
+    }
+
+    // 9. updateGridDescriptor
+    function updateGridDescriptor(string calldata newDescriptor) external onlyOperator {
+        require(bytes(newDescriptor).length > 0, "HeliosGrid: Empty string");
+        gridDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getListingInfo(uint256 listingId) external view returns (
+        address producer,
+        uint256 pricePerKWhWei,
+        uint256 availableKWh,
+        bool isActive
+    ) {
+        EnergyListing memory listing = listings[listingId];
+        return (listing.producer, listing.pricePerKWhWei, listing.availableKWh, listing.isActive);
+    }
+}
